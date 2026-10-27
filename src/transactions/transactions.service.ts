@@ -1,5 +1,4 @@
 import { and, eq, inArray, sql } from 'drizzle-orm';
-import { constants as statusCode } from 'node:http2';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
 
 import {
@@ -8,33 +7,27 @@ import {
 } from '@/transactions/schemas/transactions.schema';
 import { usersTable } from '@/users/schemas/user.schema';
 import { TCreateTransactionDto } from '@/transactions/dto/transaction-create.dto';
-import { HttpError } from '@/common/http-error';
+import { BadRequestException } from '@/common/errors/bad-request.exception';
+import { ConflictRequestException } from '@/common/errors/conflict-request.exception';
+import { NotFoundRequestException } from '@/common/errors/not-found-request.exception';
 
 export class TransactionsService {
   constructor(private readonly dbClient: NodePgDatabase) {}
 
   async create(data: TCreateTransactionDto) {
     if (data.fromUserId === data.toUserId) {
-      throw new HttpError(
-        statusCode.HTTP_STATUS_BAD_REQUEST,
-        'Cannot transfer money to yourself.',
-      );
+      throw new BadRequestException('Cannot transfer money to yourself.');
     }
 
     return await this.dbClient.transaction(
+      // Check existing transaction
       async (tx) => {
-        const [newTransaction] = await tx
-          .insert(transactionsTable)
-          .values({ ...data, status: TransactionStatusEnum.PENDING })
-          .onConflictDoNothing({ target: transactionsTable.idempotencyKey })
-          .returning();
+        const [existing] = await tx
+          .select()
+          .from(transactionsTable)
+          .where(eq(transactionsTable.idempotencyKey, data.idempotencyKey));
 
-        if (!newTransaction) {
-          const [existing] = await tx
-            .select()
-            .from(transactionsTable)
-            .where(eq(transactionsTable.idempotencyKey, data.idempotencyKey));
-
+        if (existing) {
           const samePayload =
             existing.fromUserId === data.fromUserId &&
             existing.toUserId === data.toUserId &&
@@ -42,15 +35,15 @@ export class TransactionsService {
               this.normalizeDecimal(data.amount);
 
           if (!samePayload) {
-            throw new HttpError(
-              statusCode.HTTP_STATUS_CONFLICT,
+            throw new ConflictRequestException(
               'Idempotency key was already used with a different request.',
             );
           }
-
           return existing;
         }
+        // Check existing transaction
 
+        // Check users and block with sorting to prevent deadlocks
         const orderedUserIds = [data.fromUserId, data.toUserId].sort();
 
         const users = await tx
@@ -64,19 +57,21 @@ export class TransactionsService {
         const toUser = users.find((u) => u.id === data.toUserId);
 
         if (!fromUser) {
-          throw new HttpError(
-            statusCode.HTTP_STATUS_NOT_FOUND,
-            'Sender not found.',
-          );
+          throw new NotFoundRequestException('Sender not found.');
         }
 
         if (!toUser) {
-          throw new HttpError(
-            statusCode.HTTP_STATUS_NOT_FOUND,
-            'Receiver not found.',
-          );
+          throw new NotFoundRequestException('Receiver not found.');
         }
+        // Check users and block with sorting to prevent deadlocks
 
+        const [newTransaction] = await tx
+          .insert(transactionsTable)
+          .values({ ...data, status: TransactionStatusEnum.PENDING })
+          .onConflictDoNothing({ target: transactionsTable.idempotencyKey })
+          .returning();
+
+        // Transfer money with checking
         // decrease Sender's amound
         const debited = await tx
           .update(usersTable)
@@ -92,10 +87,7 @@ export class TransactionsService {
           .returning({ id: usersTable.id });
 
         if (debited.length === 0) {
-          throw new HttpError(
-            statusCode.HTTP_STATUS_BAD_REQUEST,
-            'Insufficient funds.',
-          );
+          throw new BadRequestException('Insufficient funds.');
         }
 
         // increase Receiver's amound
@@ -105,6 +97,7 @@ export class TransactionsService {
             balance: sql`${usersTable.balance} + ${data.amount}::numeric`,
           })
           .where(eq(usersTable.id, data.toUserId));
+        // Transfer money with checking
 
         const [completedTransaction] = await tx
           .update(transactionsTable)
